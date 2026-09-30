@@ -328,7 +328,10 @@
     resizeT = setTimeout(() => { if (layout()) render(currentP, performance.now()); }, 220);
   });
 
-  img.onload = () => {
+  let booted = false; // img.onload can fire twice for cached images (manual call + load event); boot exactly once
+  function boot() {
+    if (booted) return;
+    booted = true;
     layout();
     if (reduceMotion || !window.gsap || !window.ScrollTrigger) {
       fallbackStatic();
@@ -351,9 +354,10 @@
     render(0, performance.now());
     rafId = requestAnimationFrame(loop);
     ScrollTrigger.refresh();
-  };
-  img.onerror = () => fallbackStatic();
+  }
+  img.onload = boot;
+  img.onerror = () => { if (!booted) { booted = true; fallbackStatic(); } };
   // cached image edge case
-  if (img.complete && img.naturalWidth) img.onload();
+  if (img.complete && img.naturalWidth) boot();
 
 })();
