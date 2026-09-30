@@ -59,7 +59,11 @@
     document.querySelectorAll('.reveal').forEach(el => el.classList.add('in'));
   }
 
-  /* ================= SCROLL-SHATTER ================= */
+  /* ================= SCROLL-SHATTER =================
+     Tight scrub sequence: idle -> shatter -> swirl -> reassemble ->
+     dock-left + copy-right. Fine glowing shards (baked sprite atlas).
+     End state is fully JS-driven so it is deterministic on every viewport.
+  */
   const section = document.getElementById('shatter');
   const stage = document.getElementById('shatterStage');
   const canvas = document.getElementById('shatterCanvas');
@@ -72,17 +76,31 @@
   const img = new Image();
   img.src = 'assets/robot-hero.webp';
 
+  // phase windows as fractions of scrub progress p — deliberately tight and
+  // slightly overlapping, so something is always animating between 0.05 and 0.86
+  const PH = {
+    idleEnd: 0.05,
+    ex0: 0.05, ex1: 0.32,   // shatter / explode (per-shard stagger adds +0..0.08 to ex0)
+    sw0: 0.28, sw1: 0.54,   // swirl (overlaps explode tail)
+    dk0: 0.50, dk1: 0.80,   // reassemble / converge to dock (overlaps swirl tail)
+    cf0: 0.76, cf1: 0.86,   // crossfade canvas -> clean docked image
+    cp0: 0.64, cp1: 0.84,   // copy stagger reveal (starts while reassembling)
+    hint0: 0.02, hint1: 0.09
+  };
+  const MOBILE_BP = 920; // must match the CSS breakpoint
+
   const S = {
-    ready: false, tiles: [], off: null,
+    ready: false, shards: [], atlas: null,
     W: 0, H: 0, homeX: 0, homeY: 0, homeW: 0, homeH: 0,
-    dockX: 0, dockY: 0, dockScale: 0.42, mobile: false, diag: 0
+    dockX: 0, dockY: 0, dockW: 0, dockH: 0, dockScale: 0.42,
+    mobile: false, diag: 0, tw: 0, th: 0, padCss: 0
   };
 
   function layout() {
     const W = stage.clientWidth, H = stage.clientHeight;
-    if (!W || !H) return;
+    if (!W || !H || !img.naturalWidth) return false;
     S.W = W; S.H = H;
-    S.mobile = W < 640;
+    S.mobile = W < MOBILE_BP;
     S.diag = Math.hypot(W, H);
     const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
     canvas.width = Math.round(W * dpr);
@@ -90,163 +108,224 @@
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     const ar = img.naturalWidth / img.naturalHeight;
-    let homeH = H * (S.mobile ? 0.52 : 0.76);
+    let homeH = H * (S.mobile ? 0.46 : 0.78);
     let homeW = homeH * ar;
-    const maxW = W * (S.mobile ? 0.62 : 0.5);
+    const maxW = W * (S.mobile ? 0.66 : 0.46);
     if (homeW > maxW) { homeW = maxW; homeH = homeW / ar; }
     S.homeW = homeW; S.homeH = homeH;
     S.homeX = (W - homeW) / 2;
-    S.homeY = (H - homeH) / 2 - (S.mobile ? H * 0.06 : 0);
+    S.homeY = (H - homeH) / 2 - (S.mobile ? H * 0.04 : 0);
 
-    // offscreen: image fitted exactly to home rect
+    // ---- fine shard grid ----
+    const cols = S.mobile ? 30 : 54;
+    const rows = S.mobile ? 34 : 62;
+    const tw = homeW / cols, th = homeH / rows;
+    S.tw = tw; S.th = th;
+
+    // full-res source for brightness sampling + atlas painting
+    const AA = 2;
     const off = document.createElement('canvas');
-    const odpr = 1.5;
-    off.width = Math.round(homeW * odpr);
-    off.height = Math.round(homeH * odpr);
+    off.width = Math.max(2, Math.round(homeW * AA));
+    off.height = Math.max(2, Math.round(homeH * AA));
     const octx = off.getContext('2d', { willReadFrequently: true });
     octx.drawImage(img, 0, 0, off.width, off.height);
-    S.off = off;
-
-    // tile grid
-    const cols = S.mobile ? 14 : 26;
-    const rows = S.mobile ? 16 : 30;
-    const tw = homeW / cols, th = homeH / rows;
-    const sw = off.width / cols, sh = off.height / rows;
-    let px;
+    let px = null;
     try { px = octx.getImageData(0, 0, off.width, off.height).data; }
     catch (e) { px = null; }
-    const rnd = mulberry32(1337);
-    const tiles = [];
+
+    // ---- sprite atlas with baked red-glow shard edges ----
+    // (glow is baked once at layout time so per-frame rendering stays cheap)
+    const PAD = 8; // atlas-px padding around each tile for glow bleed
+    const cwA = Math.ceil(tw * AA) + PAD * 2;
+    const chA = Math.ceil(th * AA) + PAD * 2;
+    const atlas = document.createElement('canvas');
+    atlas.width = cols * cwA;
+    atlas.height = rows * chA;
+    const actx = atlas.getContext('2d');
+    S.padCss = PAD / AA;
+
+    const rnd = mulberry32(20261001);
+    const shards = [];
+    const swA = off.width / cols, shA = off.height / rows;
     for (let r = 0; r < rows; r++) {
       for (let c = 0; c < cols; c++) {
         if (px) {
-          // sample center brightness; skip near-black tiles for a cleaner shard silhouette
-          const sx = Math.min(off.width - 1, Math.floor((c + 0.5) * sw));
-          const sy = Math.min(off.height - 1, Math.floor((r + 0.5) * sh));
+          const sx = Math.min(off.width - 1, Math.floor((c + 0.5) * swA));
+          const sy = Math.min(off.height - 1, Math.floor((r + 0.5) * shA));
           const i = (sy * off.width + sx) * 4;
-          const bright = (px[i] + px[i + 1] + px[i + 2]) / 3;
-          if (bright < 14) continue;
+          if ((px[i] + px[i + 1] + px[i + 2]) / 3 < 12) continue; // skip near-black
         }
-        tiles.push({
-          c, r,
-          sx: c * sw, sy: r * sh, sw, sh, tw, th,
+        const ax = c * cwA, ay = r * chA;
+        actx.drawImage(off, c * swA, r * shA, swA, shA,
+          ax + PAD, ay + PAD, cwA - PAD * 2, chA - PAD * 2);
+        // baked red glow edge
+        actx.save();
+        actx.shadowColor = 'rgba(255,45,45,0.95)';
+        actx.shadowBlur = 9;
+        actx.strokeStyle = 'rgba(255,96,96,0.9)';
+        actx.lineWidth = 2.5;
+        actx.strokeRect(ax + PAD + 1, ay + PAD + 1, cwA - PAD * 2 - 2, chA - PAD * 2 - 2);
+        actx.restore();
+        actx.strokeStyle = 'rgba(255,130,130,0.5)';
+        actx.lineWidth = 1;
+        actx.strokeRect(ax + PAD + 1, ay + PAD + 1, cwA - PAD * 2 - 2, chA - PAD * 2 - 2);
+
+        shards.push({
+          c, r, ax, ay, aw: cwA, ah: chA,
           ang: rnd() * Math.PI * 2,
-          dist: 0.18 + rnd() * 0.55,
-          rot: (rnd() - 0.5) * 5,
+          dist: 0.10 + rnd() * 0.38,
+          rot: (rnd() - 0.5) * 6,
           sdir: rnd() > 0.5 ? 1 : -1,
-          samt: (0.5 + rnd() * 1.1) * Math.PI
+          samt: (0.6 + rnd() * 1.2) * Math.PI,
+          dly: rnd() // deterministic per-shard stagger for the shatter cascade
         });
       }
     }
-    S.tiles = tiles;
+    S.atlas = atlas;
+    S.shards = shards;
 
-    // dock rect (must match the #shatterDocked img we crossfade to)
+    // ---- deterministic end-state geometry (JS is the single source of truth) ----
     const dw = homeW * S.dockScale, dh = homeH * S.dockScale;
+    S.dockW = dw; S.dockH = dh;
     if (S.mobile) {
+      // docked top-center, copy centered below it
       S.dockX = (W - dw) / 2;
-      S.dockY = H * 0.09;
+      S.dockY = H * 0.08;
+      setDocked(S.dockX, S.dockY, dw);
+      const cwCopy = Math.min(W * 0.88, 520);
+      copy.style.width = cwCopy + 'px';
+      copy.style.left = ((W - cwCopy) / 2) + 'px';
+      copy.style.right = 'auto';
+      copy.style.top = (S.dockY + dh + Math.min(28, H * 0.035)) + 'px';
+      copy.style.transform = 'none';
+      copy.style.textAlign = 'center';
     } else {
+      // robot reassembles SMALL on the LEFT, copy reveals on the RIGHT
       S.dockX = W * 0.07;
       S.dockY = (H - dh) / 2;
+      setDocked(S.dockX, S.dockY, dw);
+      const cwCopy = Math.min(W * 0.44, 560);
+      copy.style.width = cwCopy + 'px';
+      copy.style.left = (W * 0.94 - cwCopy) + 'px';
+      copy.style.right = 'auto';
+      copy.style.top = '50%';
+      copy.style.transform = 'translateY(-50%)';
+      copy.style.textAlign = 'left';
     }
-    docked.style.left = S.dockX + 'px';
-    docked.style.top = S.dockY + 'px';
-    docked.style.width = dw + 'px';
-    docked.style.transform = 'none';
     S.ready = true;
+    return true;
+  }
+
+  function setDocked(x, y, w) {
+    docked.style.left = x + 'px';
+    docked.style.top = y + 'px';
+    docked.style.width = w + 'px';
+    docked.style.transform = 'none';
+    docked.style.right = 'auto';
   }
 
   function render(p, now) {
     if (!S.ready) return;
-    const { W, H, tiles, off } = S;
-    const eT = easeIO(smooth(0.15, 0.45, p));   // explode
-    const sT = easeIO(smooth(0.45, 0.72, p));   // swirl
-    const dT = easeIO(smooth(0.72, 0.94, p));   // dock / reassemble
+    const { W, H, shards, atlas } = S;
+    const tw = S.tw, th = S.th, padC = S.padCss;
     const cx = W / 2, cy = H / 2;
 
-    ctx.clearRect(0, 0, W, H);
-    const canvasAlpha = 1 - smooth(0.94, 1.0, p);
-    const glow = eT * (1 - dT);
+    const sT = easeIO(smooth(PH.sw0, PH.sw1, p)); // swirl
+    const dT = easeIO(smooth(PH.dk0, PH.dk1, p)); // dock / reassemble
 
-    for (let k = 0; k < tiles.length; k++) {
-      const t = tiles[k];
-      const hx = S.homeX + (t.c + 0.5) * t.tw;
-      const hy = S.homeY + (t.r + 0.5) * t.th;
+    ctx.clearRect(0, 0, W, H);
+    const canvasAlpha = 1 - smooth(PH.cf0, PH.cf1, p);
+    ctx.globalAlpha = canvasAlpha;
+
+    for (let k = 0; k < shards.length; k++) {
+      const s = shards[k];
+      const eT = easeIO(smooth(PH.ex0 + s.dly * 0.08, PH.ex1, p)); // staggered shatter
+      const hx = S.homeX + (s.c + 0.5) * tw;
+      const hy = S.homeY + (s.r + 0.5) * th;
 
       // idle float before the shatter begins
-      const fy = p < 0.15 ? Math.sin(now * 0.0012 + t.c * 0.35 + t.r * 0.2) * 6 * (1 - p / 0.15) : 0;
+      const fy = p < PH.idleEnd
+        ? Math.sin(now * 0.0012 + s.c * 0.35 + s.r * 0.2) * 6 * (1 - p / PH.idleEnd)
+        : 0;
 
       // explode outward + downward drift
-      const ex = Math.cos(t.ang) * t.dist * S.diag;
-      const ey = Math.sin(t.ang) * t.dist * S.diag * 0.72 + eT * eT * H * 0.26;
+      const ex = Math.cos(s.ang) * s.dist * S.diag;
+      const ey = Math.sin(s.ang) * s.dist * S.diag * 0.7 + eT * eT * H * 0.22;
       let x = hx + ex * eT;
       let y = hy + ey * eT + fy;
 
       // swirl around stage center
       if (sT > 0) {
-        const a = sT * t.samt * t.sdir;
-        const pull = 1 - 0.28 * sT;
+        const a = sT * s.samt * s.sdir;
+        const pull = 1 - 0.30 * sT;
         const dx = (x - cx) * pull, dy = (y - cy) * pull;
         const ca = Math.cos(a), sa = Math.sin(a);
         x = cx + dx * ca - dy * sa;
         y = cy + dx * sa + dy * ca;
       }
 
-      // converge to docked rect
-      const tx = S.dockX + (t.c + 0.5) * t.tw * S.dockScale;
-      const ty = S.dockY + (t.r + 0.5) * t.th * S.dockScale;
+      // converge onto the docked rect (smaller, left side)
+      const tx = S.dockX + (s.c + 0.5) * tw * S.dockScale;
+      const ty = S.dockY + (s.r + 0.5) * th * S.dockScale;
       x = lerp(x, tx, dT);
       y = lerp(y, ty, dT);
 
-      const sc = (1 + eT * 0.22) * lerp(1, S.dockScale, dT);
-      const rot = eT * t.rot + sT * t.sdir * 1.7;
+      const sc = (1 + eT * 0.25) * lerp(1, S.dockScale, dT);
+      const rot = eT * s.rot + sT * s.sdir * 1.6;
 
       ctx.save();
       ctx.translate(x, y);
       ctx.rotate(rot);
       ctx.scale(sc, sc);
-      ctx.globalAlpha = canvasAlpha;
-      if (glow > 0.02) {
-        ctx.shadowColor = 'rgba(255,45,45,' + (0.85 * glow).toFixed(3) + ')';
-        ctx.shadowBlur = 16 * glow;
-      }
-      ctx.drawImage(off, t.sx, t.sy, t.sw, t.sh, -t.tw / 2, -t.th / 2, t.tw, t.th);
+      ctx.drawImage(atlas, s.ax, s.ay, s.aw, s.ah,
+        -tw / 2 - padC, -th / 2 - padC, tw + padC * 2, th + padC * 2);
       ctx.restore();
     }
+    ctx.globalAlpha = 1;
 
-    // crossfade to clean docked image + reveal copy
-    docked.style.opacity = smooth(0.93, 1.0, p).toFixed(3);
-    copy.style.opacity = smooth(0.76, 0.85, p).toFixed(3);
-    copy.style.visibility = p > 0.74 ? 'visible' : 'hidden';
-    for (let i = 0; i < items.length; i++) {
-      const it = smooth(0.78 + i * 0.03, 0.88 + i * 0.03, p);
+    // crossfade to the clean docked image + stagger-reveal the copy
+    docked.style.opacity = smooth(PH.cf0, PH.cf1, p).toFixed(3);
+    const cpO = smooth(PH.cp0, PH.cp1, p);
+    copy.style.opacity = cpO.toFixed(3);
+    copy.style.visibility = p > PH.cp0 ? 'visible' : 'hidden';
+    const n = items.length;
+    for (let i = 0; i < n; i++) {
+      const t0 = PH.cp0 + (i / n) * (PH.cp1 - PH.cp0) * 0.7;
+      const it = smooth(t0, Math.min(PH.cp1, t0 + 0.12), p);
       items[i].style.opacity = it.toFixed(3);
-      items[i].style.transform = 'translateY(' + ((1 - it) * 36).toFixed(1) + 'px)';
+      items[i].style.transform = 'translateY(' + ((1 - it) * 34).toFixed(1) + 'px)';
     }
-    hint.style.opacity = (1 - smooth(0.03, 0.16, p)).toFixed(3);
+    hint.style.opacity = (1 - smooth(PH.hint0, PH.hint1, p)).toFixed(3);
   }
 
   function fallbackStatic() {
-    // reduced-motion / no-GSAP / image-fail: show the end state, no pin
+    // reduced-motion / no-GSAP / image-fail: show the composed end state, no pin
     canvas.style.display = 'none';
+    ['left', 'top', 'width', 'transform', 'right', 'textAlign'].forEach(k => {
+      docked.style[k] = ''; copy.style[k] = '';
+    });
     docked.style.opacity = '1';
-    docked.style.left = ''; docked.style.top = ''; docked.style.width = ''; docked.style.transform = '';
     copy.style.opacity = '1'; copy.style.visibility = 'visible';
     items.forEach(el => { el.style.opacity = '1'; el.style.transform = 'none'; });
     hint.style.display = 'none';
   }
 
-  let rafId = 0;
+  let rafId = 0, layoutTries = 0;
   function loop(now) {
-    const r = stage.getBoundingClientRect();
-    if (r.bottom > 0 && r.top < window.innerHeight) render(currentP, now);
+    // safety net: if layout never succeeded (e.g. zero-size stage on load),
+    // retry for a short while instead of leaving a black canvas
+    if (!S.ready && layoutTries < 90) { layoutTries++; layout(); }
+    if (S.ready) {
+      const r = stage.getBoundingClientRect();
+      if (r.bottom > 0 && r.top < window.innerHeight) render(currentP, now);
+    }
     rafId = requestAnimationFrame(loop);
   }
 
   let resizeT = 0;
   window.addEventListener('resize', () => {
     clearTimeout(resizeT);
-    resizeT = setTimeout(() => { if (S.ready) { layout(); render(currentP, performance.now()); } }, 220);
+    resizeT = setTimeout(() => { if (layout()) render(currentP, performance.now()); }, 220);
   });
 
   img.onload = () => {
@@ -262,7 +341,7 @@
       scrollTrigger: {
         trigger: section,
         start: 'top top',
-        end: '+=280%',
+        end: '+=160%',
         pin: true,
         scrub: 1,
         anticipatePin: 1,
