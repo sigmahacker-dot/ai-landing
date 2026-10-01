@@ -55,6 +55,11 @@
     gsap.from('.hero-copy > *', { y: 44, opacity: 0, duration: 1, stagger: 0.12, ease: 'power3.out', delay: 0.15 });
     gsap.from('#heroRobot', { scale: 0.82, opacity: 0, duration: 1.4, ease: 'power3.out', delay: 0.35 });
     gsap.from('.stat-card', { scale: 0.6, opacity: 0, duration: 0.9, stagger: 0.14, ease: 'back.out(1.6)', delay: 0.9 });
+    /* gentle idle float AFTER the entrance, in GSAP only — the old CSS
+       keyframe floats fought GSAP's inline transforms and made the hero
+       image/cards shake oddly */
+    gsap.to('#heroRobot', { y: -14, duration: 2.75, yoyo: true, repeat: -1, ease: 'sine.inOut', delay: 2 });
+    gsap.to('.stat-card', { y: -9, duration: 3, yoyo: true, repeat: -1, ease: 'sine.inOut', stagger: { each: 0.65 }, delay: 2.4 });
   } else {
     document.querySelectorAll('.reveal').forEach(el => el.classList.add('in'));
   }
